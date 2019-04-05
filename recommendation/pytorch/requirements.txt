@@ -1,4 +1,6 @@
 tqdm==4.20.0
 scipy
+torch
+numpy
 pandas
 mlperf_compliance==0.0.10
