@@ -66,7 +66,7 @@ def serialize_to_file(obj, file_name, append=False):
     pickle.dump(obj, output_file)
   logging.info("Done serializing to file %s.", file_name)
 
-def savez_two_column(matrix, row_offset, file_name, append=False):
+def savez_two_column(matrix, row_offset, file_name, append=False, dtype=np.int32):
   """Savez_compressed obj to file_name."""
   logging.info("Saving obj to file in two column .npz format %s.", file_name)
   tc = []
@@ -75,7 +75,7 @@ def savez_two_column(matrix, row_offset, file_name, append=False):
     for item in items:
       tc.append([user, item])
   
-  np.savez_compressed(file_name, np.asarray(tc))
+  np.savez_compressed(file_name, np.asarray(tc, dtype=dtype))
   logging.info("Done saving to file %s.", file_name)
 
 def sorted_product_set(array_a, array_b):
