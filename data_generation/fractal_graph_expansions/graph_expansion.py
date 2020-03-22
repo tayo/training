@@ -24,6 +24,7 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import contextlib
 
 from six.moves import xrange
 
@@ -32,6 +33,8 @@ from absl import logging
 from scipy import sparse
 
 import util
+import multiprocessing.pool
+import numpy as np
 from random_matrix_ops import shuffle_sparse_coo_matrix
 
 
@@ -43,9 +46,7 @@ SparseMatrixMetadata = collections.namedtuple(
     ])
 
 
-def _compute_and_write_row_block(
-    i, left_matrix, right_matrix, train_indices_out_path, test_indices_out_path,
-    remove_empty_rows):
+def _compute_and_write_row_block(args):
   """Compute row block (shard) of expansion for row i of the left_matrix.
 
   Compute a shard of the randomized Kronecker product and dump it on the fly.
@@ -76,6 +77,7 @@ def _compute_and_write_row_block(
   Args:
     i: index of the shard. The rows i * m to (i + 1) * m of the full synthetic
       matrix matrix will be computed and dumpted to file.
+    seed: random seed to use while generating this shard.
     left_matrix: sparse SciPy csr matrix with values in [0, 1].
     right_matrix: sparse SciPy coo signed binary matrix. +1 values correspond
       to train set and -1 values correspond to test set.
@@ -89,6 +91,10 @@ def _compute_and_write_row_block(
       contains a pickled list of list each of which corresponds to a users.
     remove_empty_rows: whether to remove rows from the synthetic train and
       test matrices which are not present in the train or the test matrix.
+    thresh_train: minimum number of items required in train row to
+      avoid removal.
+    thresh_test: minimum number of items required in test row to
+      avoid removal.
 
   Returns:
     (num_removed_rows, metadata, train_metadata, test_metadata): an integer
@@ -97,6 +103,8 @@ def _compute_and_write_row_block(
       train shard and test shard.
   """
 
+  (i, seed, left_matrix, right_matrix, train_indices_out_path,
+  test_indices_out_path, remove_empty_rows, thresh_train, thresh_test) = args
   kron_blocks = []
 
   num_rows = 0
@@ -104,6 +112,8 @@ def _compute_and_write_row_block(
   num_interactions = 0
   num_train_interactions = 0
   num_test_interactions = 0
+
+  np.random.seed(seed)
 
   # Construct blocks
   for j in xrange(left_matrix.shape[1]):
@@ -117,14 +127,14 @@ def _compute_and_write_row_block(
 
     kron_blocks.append(kron_block)
 
-    logging.info("Done with element (%d, %d)", i, j)
+    logging.info("[%d] Done with element (%d, %d)", i, i, j)
 
   rows_to_write = sparse.hstack(kron_blocks).tocoo()
 
   train_rows_to_write = util.sparse_where_equal(rows_to_write, 1)
   test_rows_to_write = util.sparse_where_equal(rows_to_write, -1)
 
-  logging.info("Producing data set row by row")
+  logging.info("[%d] Producing data set row by row", i)
 
   all_train_items_to_write = []
   all_test_items_to_write = []
@@ -141,9 +151,10 @@ def _compute_and_write_row_block(
     num_train = train_items_to_write.shape[0]
     num_test = test_items_to_write.shape[0]
 
-    if remove_empty_rows and ((not num_train) or (not num_test)):
-      logging.info("Removed empty output row %d.",
-                   i * left_matrix.shape[0] + k)
+    if remove_empty_rows and (
+        (num_train < thresh_train) or (num_test < thresh_test)):
+      logging.info("[%d] Removed under-threshold output row %d.",
+                   i, i * left_matrix.shape[0] + k)
       num_removed_rows += 1
       continue
 
@@ -156,16 +167,16 @@ def _compute_and_write_row_block(
     all_test_items_to_write.append(test_items_to_write)
 
     if k % 1000 == 0:
-      logging.info("Done producing data set row %d.", k)
+      logging.info("[%d] Done producing data set row %d.", i, k)
 
-  logging.info("Done producing data set row by row.")
+  logging.info("[%d] Done producing data set row by row.", i)
 
   util.savez_two_column(
-      all_train_items_to_write, 
+      all_train_items_to_write,
       row_offset=(i * right_matrix.shape[0]),
       file_name=train_indices_out_path + ("_%d" % i))
   util.savez_two_column(
-      all_test_items_to_write, 
+      all_test_items_to_write,
       row_offset=(i * right_matrix.shape[0]),
       file_name=test_indices_out_path + ("_%d" % i))
 
@@ -177,22 +188,28 @@ def _compute_and_write_row_block(
   test_metadata = SparseMatrixMetadata(num_interactions=num_test_interactions,
                                        num_rows=num_rows, num_cols=num_cols)
 
-  logging.info("Done with left matrix row %d.", i)
-  logging.info("%d interactions written in shard.", num_interactions)
-  logging.info("%d rows removed in shard.", num_removed_rows)
-  logging.info("%d train interactions written in shard.",
-               num_train_interactions)
-  logging.info("%d test interactions written in shard.",
-               num_test_interactions)
+  logging.info("[%d] Done with left matrix row %d.", i, i)
+  logging.info("[%d] %d interactions written in shard.", i, num_interactions)
+  logging.info("[%d] %d rows removed in shard.", i, num_removed_rows)
+  logging.info("[%d] %d train interactions written in shard.",
+               i, num_train_interactions)
+  logging.info("[%d] %d test interactions written in shard.",
+               i, num_test_interactions)
 
-  return (num_removed_rows, metadata, train_metadata, test_metadata)
+  return {
+      "num_removed_rows": num_removed_rows,
+      "metadata": metadata,
+      "train_metadata": train_metadata,
+      "test_metadata": test_metadata
+  }
 
 
 def output_randomized_kronecker_to_pickle(
     left_matrix, right_matrix,
     train_indices_out_path, test_indices_out_path,
     train_metadata_out_path=None, test_metadata_out_path=None,
-    remove_empty_rows=True):
+    remove_empty_rows=True, per_row_threshold_train=1,
+    per_row_threshold_test=1):
   """Compute randomized Kronecker product and dump it on the fly.
 
   A standard Kronecker product between matrices A and B produces
@@ -242,6 +259,10 @@ def output_randomized_kronecker_to_pickle(
       in a pickled SparseMatrixMetadata named tuple.
     remove_empty_rows: whether to remove rows from the synthetic train and
       test matrices which are not present in the train or the test matrix.
+    per_row_threshold_train: minimum number of items required in train row to
+      avoid removal.
+    per_row_threshold_test: minimum number of items required in test row to
+      avoid removal.
 
   Returns:
     (metadata, train_metadata, test_metadata) triplet of SparseMatrixMetadata
@@ -263,12 +284,35 @@ def output_randomized_kronecker_to_pickle(
         "Values of sparse matrix should be -1 or 1 but are:",
         set(right_matrix.data))
 
+
+  num_workers = int(multiprocessing.cpu_count() * 0.5) or 1
+  num_shards = left_matrix.shape[0]
+  # Use different random seeds for each process.
+  rand_seeds = [np.random.randint(2**32) for _ in range(num_shards)]
+  map_args = [(i, rand_seeds[i], left_matrix, right_matrix,
+               train_indices_out_path, test_indices_out_path,
+               remove_empty_rows, per_row_threshold_train,
+               per_row_threshold_test) for i in range(num_shards)]
+  logging.info("Calling computation on %d blocks with %d workers.",
+               num_shards, num_workers)
+  with contextlib.closing(multiprocessing.pool.ThreadPool(num_workers)) as pool:
+    result_data = pool.map(_compute_and_write_row_block, map_args)
+
+  num_rows = sum([i["metadata"].num_rows for i in result_data])
+  num_interactions = sum([i["metadata"].num_interactions for i in result_data])
+  num_train_interactions = sum([i["train_metadata"].num_interactions for i in result_data])
+  num_test_interactions = sum([i["test_metadata"].num_interactions for i in result_data])
+  num_removed_rows = sum([i["num_removed_rows"] for i in result_data])
+
+
+  """
   for i in xrange(left_matrix.shape[0]):
 
     (shard_num_removed_rows, shard_metadata, shard_train_metadata,
      shard_test_metadata) = _compute_and_write_row_block(
          i, left_matrix, right_matrix, train_indices_out_path,
-         test_indices_out_path, remove_empty_rows)
+         test_indices_out_path, remove_empty_rows,
+         per_row_threshold_train, per_row_threshold_test)
 
     num_rows += shard_metadata.num_rows
     num_removed_rows += shard_num_removed_rows
@@ -280,6 +324,7 @@ def output_randomized_kronecker_to_pickle(
     logging.info("%d total rows removed.", num_removed_rows)
     logging.info("%d total train interactions written.", num_train_interactions)
     logging.info("%d toal test interactions written.", num_test_interactions)
+  """
 
   logging.info("Done writing.")
 
